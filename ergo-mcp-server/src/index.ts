@@ -15,7 +15,6 @@ import * as path from 'path';
 const REPO_URL = process.env.GITHUB_REPO_URL || "https://github.com/Degens-World/Ergo-Skills";
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN; // Optional, boosts rate limits
 const registry = new SkillRegistry(REPO_URL, GITHUB_TOKEN);
-registry.loadSkills();
 
 const server = new Server(
     {
@@ -206,6 +205,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 async function run() {
+    await registry.loadSkills();
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error("Ergo MCP Server running on stdio");
