@@ -92,20 +92,54 @@ export async function deployErgoNode(args: any) {
 
         // 3. Configuration File Generation
         const apiKeyHash = crypto.createHash('sha256').update(api_key_password).digest('hex');
+        const isTestnet = network === 'testnet';
+        const apiPort = isTestnet ? 9052 : 9053;
+        const p2pPort = isTestnet ? 9022 : 9030;
+
+        // CRITICAL: Testnet requires magicBytes = [2, 3, 2, 3] (NOT the default [2, 2, 2, 2]).
+        // Without this override, the Ergo NetworkController drops every peer after handshake
+        // because SessionIdPeerFeature.networkMagic doesn't match settings.magicBytes.
+        // Peers connect, exchange handshakes, then are immediately removed — with NO error message.
+        // The value was confirmed by decoding raw TCP bytes from live testnet peers.
+        //
+        // upnpEnabled must be false to prevent the node from advertising an unreachable
+        // external IP, which remote peers verify and reject.
+        const networkSection = isTestnet ? `
+scorex {
+  network {
+    bindAddress = "0.0.0.0:${p2pPort}"
+    upnpEnabled = false
+    magicBytes = [2, 3, 2, 3]
+    maxConnections = 100
+    knownPeers = [
+      "213.239.193.208:9023",
+      "176.9.15.237:9021",
+      "128.253.41.110:9020"
+    ]
+  }
+}` : '';
+
         const configContent = `
 ergo {
+  ${isTestnet ? 'networkType = "testnet"' : ''}
+  ${isTestnet ? 'directory = ${user.dir}"/.ergo/testnet/data"' : ''}
   node {
     mining = false
+    extraIndex = true
   }
 }
 scorex {
   restApi {
     apiKeyHash = "${apiKeyHash}"
+    corsAllowedOrigin = "*"
+    bindAddress = "0.0.0.0:${apiPort}"
   }
 }
+${networkSection}
         `;
         const configPath = path.join(nodeDir, 'ergo.conf');
         fs.writeFileSync(configPath, configContent.trim());
+
 
         // 4. Node Execution
         const memoryFlag = `-Xmx${memory_allocation_gb}G`;
