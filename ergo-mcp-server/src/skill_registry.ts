@@ -16,6 +16,8 @@ interface Skill {
     metadata: SkillMetadata;
 }
 
+const ALLOWED_SKILL_HOSTS = ['raw.githubusercontent.com', 'github.com'];
+
 export class SkillRegistry {
     private skills: Map<string, Skill> = new Map();
     private repoOwner: string;
@@ -24,14 +26,11 @@ export class SkillRegistry {
     private githubToken?: string;
 
     constructor(repoUrl: string = "https://github.com/Degens-World/Ergo-Skills", githubToken?: string) {
-        // Parse owner/repo from URL
-        // Expected format: https://github.com/OWNER/REPO
         const match = repoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
         if (match) {
             this.repoOwner = match[1];
             this.repoName = match[2].replace('.git', '');
         } else {
-            // Fallback default
             this.repoOwner = "Degens-World";
             this.repoName = "Ergo-Skills";
         }
@@ -49,10 +48,9 @@ export class SkillRegistry {
         }
     }
 
-    private async scanDirectory(path: string) {
-        // Construct GitHub API URL for contents
-        const url = `https://api.github.com/repos/${this.repoOwner}/${this.repoName}/contents/${path}`;
-        const headers: any = {
+    private async scanDirectory(dirPath: string) {
+        const url = `https://api.github.com/repos/${encodeURIComponent(this.repoOwner)}/${encodeURIComponent(this.repoName)}/contents/${dirPath}`;
+        const headers: Record<string, string> = {
             'Accept': 'application/vnd.github.v3+json',
             'User-Agent': 'Ergo-MCP-Server'
         };
@@ -68,15 +66,28 @@ export class SkillRegistry {
 
             for (const item of items) {
                 if (item.type === 'dir') {
-                    // Recurse into subdirectories
                     await this.scanDirectory(item.path);
                 } else if (item.type === 'file' && item.name === 'SKILL.md') {
-                    // Start fetching the skill content if found
-                    await this.fetchAndParseSkill(item.download_url, item.path);
+                    if (this.isAllowedUrl(item.download_url)) {
+                        await this.fetchAndParseSkill(item.download_url, item.path);
+                    } else {
+                        console.error(`Skipping skill at ${item.path}: download URL not from allowed host`);
+                    }
                 }
             }
         } catch (error: any) {
-            console.error(`Error scanning ${path}: ${error.message}`);
+            console.error(`Error scanning ${dirPath}: ${error.message}`);
+        }
+    }
+
+    private isAllowedUrl(url: string): boolean {
+        try {
+            const parsed = new URL(url);
+            return parsed.protocol === 'https:' && ALLOWED_SKILL_HOSTS.some(
+                host => parsed.hostname === host || parsed.hostname.endsWith('.' + host)
+            );
+        } catch {
+            return false;
         }
     }
 
@@ -88,16 +99,14 @@ export class SkillRegistry {
             if (typeof response.data === 'string') {
                 content = response.data;
             } else {
-                // Should be raw text usually
                 content = JSON.stringify(response.data);
             }
 
-            // Extract frontmatter
-            // Using regex that handles both CRLF and LF
+            // Extract frontmatter using safe YAML schema
             const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
             if (match) {
                 const frontmatter = match[1];
-                const meta = yaml.load(frontmatter) as SkillMetadata;
+                const meta = yaml.load(frontmatter, { schema: yaml.JSON_SCHEMA }) as SkillMetadata;
                 if (meta && meta.name) {
                     this.skills.set(meta.name, {
                         name: meta.name,
@@ -119,7 +128,6 @@ export class SkillRegistry {
         for (const [key, skill] of this.skills.entries()) {
             const toolName = skill.name.replace(/-/g, '_').toLowerCase();
 
-            // Native Implementation Check
             let inputSchema;
             if (key === 'local-ergo-node-deployment' || toolName === 'deploy_ergo_node') {
                 inputSchema = DeployNodeSchema;
@@ -153,12 +161,10 @@ export class SkillRegistry {
 
         const skill = this.skills.get(skillKey)!;
 
-        // Native Execution
         if (skillKey === 'local-ergo-node-deployment' || name === 'deploy_ergo_node') {
             return await deployErgoNode(args);
         }
 
-        // Return Instructions
         return {
             status: "manual_instructions",
             description: `No automated implementation for ${skill.name} yet.`,

@@ -5,6 +5,17 @@ import { spawn } from 'child_process';
 import axios from 'axios';
 import * as crypto from 'crypto';
 
+// Runtime validation schema
+const DeployNodeArgs = z.object({
+    version: z.string().regex(/^\d+\.\d+\.\d+$|^latest$/, "Version must be semver (e.g. '5.0.16') or 'latest'"),
+    api_key_password: z.string().min(8, "API key password must be at least 8 characters"),
+    network: z.enum(['mainnet', 'testnet']).default('mainnet'),
+    directory: z.string()
+        .regex(/^[a-zA-Z0-9_\-]+$/, "Directory name must be alphanumeric (hyphens and underscores allowed, no path separators)")
+        .default('ergo_node'),
+    memory_allocation_gb: z.number().int().min(1).max(64).default(4)
+});
+
 export const DeployNodeSchema = {
     type: "object",
     properties: {
@@ -35,11 +46,31 @@ export const DeployNodeSchema = {
     required: ["version", "api_key_password"]
 };
 
+const ALLOWED_DOWNLOAD_HOSTS = ['github.com', 'objects.githubusercontent.com'];
+
+function validateDownloadUrl(url: string): void {
+    try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== 'https:') {
+            throw new Error('Download URL must use HTTPS');
+        }
+        if (!ALLOWED_DOWNLOAD_HOSTS.some(host => parsed.hostname === host || parsed.hostname.endsWith('.' + host))) {
+            throw new Error(`Download URL host not allowed: ${parsed.hostname}`);
+        }
+    } catch (e: any) {
+        if (e.message.startsWith('Download URL')) throw e;
+        throw new Error(`Invalid download URL: ${url}`);
+    }
+}
+
 export async function deployErgoNode(args: any) {
-    const { version, api_key_password, network = 'mainnet', directory = 'ergo_node', memory_allocation_gb = 4 } = args;
+    // Validate all inputs at runtime
+    const { version, api_key_password, network, directory, memory_allocation_gb } = DeployNodeArgs.parse(args);
+
+    const isTestnet = network === 'testnet';
 
     try {
-        // 1. Directory Creation
+        // 1. Directory Creation (safe — directory is validated to be a simple name)
         const nodeDir = path.resolve(process.cwd(), directory);
         if (!fs.existsSync(nodeDir)) {
             fs.mkdirSync(nodeDir, { recursive: true });
@@ -56,32 +87,26 @@ export async function deployErgoNode(args: any) {
             downloadUrl = asset.browser_download_url;
             fileName = asset.name;
         } else {
-            // Find specific version logic 
-            // Simplified: direct download URL construction or tag search
-            // Let's assume the user provides a valid version like '5.0.16'
-            try {
-                const release = await axios.get(`https://api.github.com/repos/ergoplatform/ergo/releases/tags/v${version}`);
-                const asset = release.data.assets.find((a: any) => a.name.endsWith('.jar'));
-                if (!asset) throw new Error(`Could not find JAR in release v${version}`);
-                downloadUrl = asset.browser_download_url;
-                fileName = asset.name;
-            } catch (e) {
-                // Fallback for different tag naming conventions if needed, or rethrow
-                throw new Error(`Failed to find release v${version}: ${e}`);
-            }
+            const release = await axios.get(`https://api.github.com/repos/ergoplatform/ergo/releases/tags/v${encodeURIComponent(version)}`);
+            const asset = release.data.assets.find((a: any) => a.name.endsWith('.jar'));
+            if (!asset) throw new Error(`Could not find JAR in release v${version}`);
+            downloadUrl = asset.browser_download_url;
+            fileName = asset.name;
         }
 
-        // Ensure we have a filename
+        validateDownloadUrl(downloadUrl);
+
         if (!fileName) fileName = `ergo-${version}.jar`;
 
         const jarPath = path.join(nodeDir, fileName);
         if (!fs.existsSync(jarPath)) {
-            console.error(`Downloading ${fileName} from ${downloadUrl}...`);
+            console.error(`Downloading ${fileName}...`);
             const writer = fs.createWriteStream(jarPath);
             const response = await axios({
                 url: downloadUrl,
                 method: 'GET',
-                responseType: 'stream'
+                responseType: 'stream',
+                maxRedirects: 5
             });
             response.data.pipe(writer);
             await new Promise((resolve, reject) => {
@@ -92,15 +117,30 @@ export async function deployErgoNode(args: any) {
 
         // 3. Configuration File Generation
         const apiKeyHash = crypto.createHash('sha256').update(api_key_password).digest('hex');
-        const configContent = `
+        const apiPort = isTestnet ? 9052 : 9053;
+        const p2pPort = isTestnet ? 9022 : 9030;
+
+        let configContent = `
 ergo {
   node {
     mining = false
-  }
+  }${isTestnet ? `
+  directory = ".ergo-testnet"` : ''}
 }
 scorex {
   restApi {
     apiKeyHash = "${apiKeyHash}"
+    bindAddress = "0.0.0.0:${apiPort}"
+  }
+  network {
+    bindAddress = "0.0.0.0:${p2pPort}"${isTestnet ? `
+    magicBytes = [2, 3, 2, 3]
+    knownPeers = [
+      "213.239.193.208:9023",
+      "176.9.15.237:9021",
+      "128.253.41.110:9020"
+    ]` : ''}
+    upnpEnabled = false
   }
 }
         `;
@@ -109,11 +149,10 @@ scorex {
 
         // 4. Node Execution
         const memoryFlag = `-Xmx${memory_allocation_gb}G`;
-        const networkFlag = network === 'testnet' ? '--testnet' : '--mainnet';
+        const networkFlag = isTestnet ? '--testnet' : '--mainnet';
 
         console.error(`Starting Ergo Node in ${nodeDir}...`);
 
-        // Prepare arguments
         const childArgs = [memoryFlag, '-jar', fileName, networkFlag, '-c', 'ergo.conf'];
 
         const child = spawn('java', childArgs, {
@@ -124,22 +163,18 @@ scorex {
 
         child.unref();
 
-        const port = network === 'testnet' ? 9052 : 9053;
-
         return {
             status: "success",
             message: `Ergo node launched successfully on ${network}.`,
-            node_directory: nodeDir,
             pid: child.pid,
-            web_panel_url: `http://127.0.0.1:${port}/panel`,
-            api_url: `http://127.0.0.1:${port}`,
-            command_executed: `java ${childArgs.join(' ')}`
+            web_panel_url: `http://127.0.0.1:${apiPort}/panel`,
+            api_url: `http://127.0.0.1:${apiPort}`
         };
 
     } catch (error: any) {
-        return {
-            status: "error",
-            message: `Failed to deploy Ergo node: ${error.message}`
-        };
+        if (error instanceof z.ZodError) {
+            return { status: "error", message: `Validation failed: ${error.errors.map(e => e.message).join(', ')}` };
+        }
+        return { status: "error", message: `Failed to deploy Ergo node: ${error.message}` };
     }
 }
